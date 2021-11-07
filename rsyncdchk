@@ -1,0 +1,876 @@
+#!/usr/bin/env python
+#
+#  Copyright (c) 2015, Parsons, Inc
+#  All rights reserved.
+#
+#  Redistribution and use in source and binary forms, with or without
+#  modification, are permitted provided that the following conditions are met:
+#
+#  *  Redistributions of source code must retain the above copyright notice,
+#     this list of conditions and the following disclaimer.
+#
+#  *  Redistributions in binary form must reproduce the above copyright
+#     notice, this list of conditions and the following disclaimer in the
+#     documentation and/or other materials provided with the distribution.
+#
+#  *  Neither the name of Parsons, Inc nor the names of its contributors may
+#     be used to endorse or promote products derived from this software
+#     without specific prior written permission.
+#
+#  THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDERS AND CONTRIBUTORS ``AS
+#  IS'' AND ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT LIMITED TO,
+#  THE IMPLIED WARRANTIES OF MERCHANTABILITY AND FITNESS FOR A PARTICULAR
+#  PURPOSE ARE DISCLAIMED.  IN NO EVENT SHALL THE COPYRIGHT HOLDERS OR
+#  CONTRIBUTORS BE LIABLE FOR ANY DIRECT, INDIRECT, INCIDENTAL, SPECIAL,
+#  EXEMPLARY, OR CONSEQUENTIAL DAMAGES (INCLUDING, BUT NOT LIMITED TO,
+#  PROCUREMENT OF SUBSTITUTE GOODS OR SERVICES; LOSS OF USE, DATA, OR PROFITS;
+#  OR BUSINESS INTERRUPTION) HOWEVER CAUSED AND ON ANY THEORY OF LIABILITY,
+#  WHETHER IN CONTRACT, STRICT LIABILITY, OR TORT (INCLUDING NEGLIGENCE OR
+#  OTHERWISE) ARISING IN ANY WAY OUT OF THE USE OF THIS SOFTWARE, EVEN IF
+#  ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
+#
+#
+# rsyncdchk	This script validates the contents of an rsyncd.conf file.  It
+#		performs only one level of checks.  The basic checks ensure
+#		that the config values have a rudimentary level of sanity; for
+#		example, directories are directories, booleans are true/false
+#		values.
+#
+#		rsyncdchk derived from the rpkichk and rcynicchk configuration
+#		validators.  Consequently, the structure bears a striking
+#		resemblance to those other programs.  rsyncdchk only supports
+#		basic checks as of now, but the program structure is retained
+#		in case more elaborate checks must be added later.
+#
+#
+#	This is the call tree for the routines (mostly) defined in this module.
+#	This tree might make it easier to update rsyncdchk in the future.
+#
+#		main()
+#			getopts()
+#
+#			readconf()		[in confvalidation.py]
+#
+#			check_rsyncd()
+#				basic_checks()
+#					basic_rsyncd()
+#
+#			results()
+#				basic_results()
+#					giveproblems()
+#					givesummary()
+#					givetable()
+#					giveparseerrs()
+#
+#
+#	It is highly likely that some of these routines can be collapsed
+#	into a smaller number of more general routines.  For now, though,
+#	this is the way it is.
+#
+#
+# Revision History
+#	1.0	Initial revision.				150611
+#
+#	Copyright 2015 PARSONS, Inc.  All rights reserved.
+#	Written by Wayne Morrison, 150611.
+#
+
+
+import os
+import sys
+import argparse
+
+import rpki.config
+import rpki.exceptions
+
+from confvalidation import *
+
+#
+# Version information.
+#
+NAME = "rsyncdchk"
+VERS = NAME + " version: 1.0"
+
+#------------------------------------------------------------------------
+# Options handled:
+#		-config conffile	specify config file to read
+#		-list			list configuration-section information
+#
+#		-problems		give problems found
+#		-summary		give summary of checks
+#		-table			show table of results
+#
+#		-basic			only basic checks
+#
+#		-verbose		turn on verbose output
+#		-help			give usage message and exit
+#		-manpage		print the manpage and exit
+#		-Version		give command version info and exit
+#
+
+DEFCONF = '/etc/rsyncd.conf'			# Default configuration file.
+
+conffile = DEFCONF				# Configuration file.
+sector = None					# Section to examine.
+
+dobasic  = 1					# Basic checks only.
+
+showsummary = 0					# Summarize checks only.
+showtable   = 0					# Show table of results.
+showprobs   = 0					# Show problems found.
+
+verbose = 0					# Verbose flag.
+
+#------------------------------------------------------------------------
+# Globbies.
+#
+
+CHECKS_BASIC  = 0;		# Flag for basic checks.
+
+cfg = None			# Data from configuration file.
+
+called	  = {}			# Section-based called flags
+badsect   = {}			# Invalid config section names.
+errors	  = {}			# Error counts by config sections.
+parseerrs = {}			# Parsing errors.
+unchecked = {}			# Unchecked-field counts by sections.
+valids	  = {}			# Valid lines by config sections.
+
+skipsect  = {}			# Section the user wants to skip.
+
+problems  = {}			# Details of basic problems in a section.
+
+
+#------------------------------------------------------------------------
+# Routine:	main()
+#
+# Purpose:	Do everything.
+#
+def main():
+	global cfg			# Configuration file contents.
+
+	#
+	# Parse our command line.
+	#
+	getopts()
+
+	#
+	# Read the configuration file.
+	#
+	cfg = readconf(conffile)
+
+	#
+	# Possibly give section info from config file.
+	#
+	if(getlistflag()):
+		lister(conffile,cfg,sector)
+		exit(0)
+
+	#
+	# Check the rsyncd.conf file.
+	#
+	check_rsyncd()
+
+	#
+	# Tell the user what they want to know.
+	#
+	results()
+
+	sys.exit(0)
+
+
+#------------------------------------------------------------------------
+# Routine:	getopts()
+#
+# Purpose:	Parse the command line for options, most importantly to
+#		find a potential non-standard config file.
+#
+def getopts():
+	global called				# Section-based called flags
+	global conffile				# Configuration file.
+	global sector				# Section-name to work with.
+	global showprobs			# Show problems found.
+	global showsummary			# Summarize checks only.
+	global showtable			# Show results table.
+	global skipsect				# Skip-sections flags hash.
+	global verbose				# Give verbose output.
+	global dobasic				# Basic checks only.
+	listflag = 0				# Section-listing flag.
+	nameflag = 0				# Section-name-listing flag.
+	summary = 0				# Give-summary flag.
+	verbose = 0				# Verbose flag.
+
+	#
+	# Build our usage string.
+	#
+	usagestr = usage(0)
+
+	#
+	# Build the options parser.
+	#
+	ap = argparse.ArgumentParser()
+
+	#
+	# Add the recognized options.
+	#
+	ap.add_argument('-config', help='path of rsyncd.conf to check')
+	ap.add_argument('-names', action='store_true', help='gives rsyncd.conf section names and field counts')
+	ap.add_argument('-section', help='lists values in the named section; used with -names')
+
+	ap.add_argument('-list', action='store_true', help='only list values in rsyncd.conf file')
+
+	ap.add_argument('-basic', action='store_true', help='only run basic checks')
+
+	ap.add_argument('-problems', action='store_true', help='show problems found')
+	ap.add_argument('-summary', action='store_true', help='summarize results')
+	ap.add_argument('-table', action='store_true', help='provide results of basic checks in tabular form')
+
+	ap.add_argument('-noroot', action='store_true', help='do not check root section')
+	ap.add_argument('-norpki', action='store_true', help='do not check rpki section')
+
+	ap.add_argument('-verbose', action='store_true', help='provide verbose output')
+	ap.add_argument('-Version', action='store_true', help='display program version')
+	ap.add_argument('-help',    action='store_true', help='display help message')
+	ap.add_argument('-manpage', action='store_true', help='display manpage')
+
+	#
+	# Now parse the options.
+	#
+	args = ap.parse_args()
+
+	#
+	# Check for some immediate options.
+	#
+	if(args.Version):		version()
+	if(args.help):			usage(1)
+	if(args.manpage):		manpage()
+	if(args.list):			listflag    = 1
+	if(args.names):			nameflag    = 1
+	if(args.problems):		showprobs   = 1
+	if(args.summary):		showsummary = 1
+	if(args.table):			showtable   = 1
+	if(args.verbose):		verbose	    = 1
+
+	skipsect['root']	= args.noroot
+	skipsect['rpki']	= args.norpki
+
+	#
+	# -name implies -list.
+	#
+	if(nameflag):
+		listflag = 1
+
+	#
+	# Set our option values in the confvalidation module.
+	#
+	setopts(listflag,nameflag,0,verbose)
+
+	#
+	# Get the config file from the arguments.  If one wasn't specified
+	# with -config, we'll use our (previously set) default.
+	#
+	if(args.config == None):
+		vprint("using default config file - \"%s\"", conffile)
+	else:
+		conffile = args.config
+
+	#
+	# Ensure the selected config file exists and is readable.
+	#
+	if(existchk(conffile) == 0):
+		print "configuration file \"%s\" does not exist" % conffile
+		exit(1);
+	if(readchk(conffile) == 0):
+		print "configuration file \"%s\" is unreadable" % conffile
+		exit(1);
+
+	#
+	# Get the section name from the arguments.
+	#
+	if(args.section != None):
+		sector = args.section
+		vprint("using section - \"%s\"\n", sector)
+
+	#
+	# If none of the output-type options were selected, then we'll
+	# use them all.
+	#
+	if((showprobs == 0) and (showsummary == 0) and (showtable == 0)):
+		showprobs   = 1
+		showsummary = 1
+		showtable   = 1
+
+	#
+	# Mark all sections as being uncalled.
+	#
+	called['root'] = 0
+	called['rpki'] = 0
+
+
+#########################################################################
+#
+# The following group of handlers validate the entries in the configuration
+# file.  Each handler has a handler function and a dictionary mapping the
+# section fields to a verification routine.
+#
+
+#------------------------------------------------------------------------
+# Handler:	basic_rsyncd()
+#
+
+fields_rsyncd = {
+			'path'			:	chkdir,
+			'read only'		:	chkbool,
+			'transfer logging'	:	chkbool,
+			'use chroot'		:	chkbool,
+		}
+
+def basic_rsyncd(sect,fkey,fval,trval):
+	global errors			# Error counts by config sections.
+	global unchecked		# Unchecked-field counts by sections.
+	global valids			# Valid-field counts by sections.
+
+	if(called[sect] == 0):
+		errors[sect] = 0
+		unchecked[sect] = 0
+		valids[sect] = 0
+		called[sect] = 1
+
+	#
+	# Initialize some result values.
+	#
+	error = 0
+	unchk = 0
+
+	if(fields_rsyncd.has_key(fkey)):
+		if(fields_rsyncd[fkey] != None):
+			error = fields_rsyncd[fkey](trval, fkey)
+		else:
+			unchk = 1
+	else:
+		#
+		# Handle special cases.
+		#
+
+		#
+		# Right now, the only known special case is a comment field.
+		# However, comments will not be checked, since they can be
+		# anything at all.  Or nothing at all.
+		#
+		if(re.search('comment', fkey, re.I) != None):
+			error = 0
+		else:
+			print "rsyncdchk:  specialty checking required for field <%s>" % fkey
+			unchk = 1
+
+	#
+	# Add the results to our running totals.
+	#
+	errors[sect]    += error
+	unchecked[sect] += unchk
+	valids[sect]    += (not error)
+
+
+#------------------------------------------------------------------------
+# This dictionary maps config-file sections to handlers for each
+# section's fields for basic checks.
+#
+# The two configuration sections we recognize both contain the same sets
+# of fields.  Consequently, they will use the same validation routine.
+#
+basic_secthandlers =	{
+				'rpki' :	basic_rsyncd,
+				'root' :	basic_rsyncd,
+			}
+
+
+#########################################################################
+
+#------------------------------------------------------------------------
+# Routine:	basic_checks()
+#
+# Purpose:	Run the basic checks on the config file's fields.
+#		This is/will be/should be run every time rsyndchk is run.
+#		This checks for things like missing files, bad permissions
+#		on key files, directory not actually a directory, etc.
+#
+def basic_checks():
+	global conffile			# Configuration file.
+	global cfg			# Configuration file contents.
+	global basic_secthandlers	# Handlers for config file sections.
+	global parseerrs		# Collected parsing errors.
+	global badsect			# Invalid config section names.
+
+	probcnt = 0			# Count of problems we found.
+
+	#
+	# Reset our list of problems.
+	#
+	getproblems(1)
+
+	#
+	# Get the sections in the config file.
+	#
+	sections = cfg.cfg.sections()
+
+	#
+	# Run the validation checks, section by section...
+	#
+	for sect in sections:
+
+		#
+		# ... maybe not this section...
+		#
+		if(skipsect[sect] != 0): continue
+
+		#
+		# ... but *definitely* these fields.
+		#
+		for (fkey, fval) in cfg.cfg.items(sect):
+
+			#
+			# We'll try to get the key's translated value.
+			#
+			if(basic_secthandlers.has_key(sect)):
+				try:
+					trval = cfg.get(fkey, section = sect)
+				except Exception, evt:
+					#
+					# The key wasn't recognized, so we'll
+					# save its name.
+					#
+					evtstr = str(evt)
+					if(parseerrs.has_key(evtstr)):
+						parseerrs[evtstr] += 1
+					else:
+						parseerrs[evtstr] = 1
+						print evtstr
+					continue
+
+				#
+				# Call the section handler for this
+				# particular key and value.
+				#
+				basic_secthandlers[sect](sect,fkey,fval,trval);
+						
+			else:
+				#
+				# The section wasn't recognized, so we'll
+				# save its name for later reporting.
+				#
+				badsect[sect] = 1
+
+		#
+		# Squirrel away the problems found in this section.
+		#
+		problems[sect] = getproblems(1)
+		probcnt += len(problems[sect])
+
+
+	#
+	# Return the number of problems we found in the file.
+	#
+	return(probcnt)
+
+
+#########################################################################
+
+#------------------------------------------------------------------------
+# Routine:	check_rsyncd()
+#
+# Purpose:	Run the validation checks on the config file's fields.
+#
+def check_rsyncd():
+
+	#
+	# Run the basic checks to ensure the rsyncd.conf file is at least
+	# minimally okay.
+	#
+	if(dobasic):
+		basic_checks()
+
+
+#########################################################################
+
+
+#------------------------------------------------------------------------
+# Routine:	basic_results()
+#
+# Purpose:	Give the results of the basic validation checks.
+#
+def basic_results():
+
+	print ""
+	print "Basic Results"
+
+	#
+	# Don't print section results if -summary was specified.
+	#
+	givetable(CHECKS_BASIC)
+
+	#
+	# Show the specific problems found in the basic checks.
+	#
+	giveproblems(CHECKS_BASIC)
+
+	#
+	# Summarize the basic validation checks.
+	#
+	givesummary(CHECKS_BASIC)
+
+	#
+	# Print any parsing errors we encountered.
+	#
+	giveparseerrs()
+
+
+#------------------------------------------------------------------------
+# Routine:	results()
+#
+# Purpose:	Give the results of the validation checks.
+#
+def results():
+
+	if(dobasic):
+		basic_results()
+
+
+
+#------------------------------------------------------------------------
+# Routine:	giveproblems()
+#
+# Purpose:	Show the problems found in each section.
+#
+def giveproblems(chktype):
+	global problems
+	probcnt = 0			# Count of problems we're reporting.
+
+	#
+	# Don't do anything here if we aren't supposed to show problems.
+	#
+	if(showprobs == 0):
+		return
+
+	#
+	# Select the problem list.  If an invalid check type was specified,
+	# then we'll manufacture a new problem to report.
+	#
+	if(chktype == CHECKS_BASIC):
+		problist = problems
+	else:
+		problist = list()
+		list[0] = "unknown check type - ", chktype
+
+	#
+	# Give a short message and return if we didn't find any problems.
+	#
+	if((len(problist) == 0) and (verbose == 0)):
+		print "no problems found\n"
+		print "no problems -- RETURNING!!!"
+		return
+
+	for sect in sorted(problist):
+		maxlen = -1			# Maximum section-name length.
+
+		probarr = problist[sect]
+
+		probs = len(probarr)
+		probcnt += probs
+#		print "%s probcnt - %d" % (sect, probs)
+
+		#
+		# If this section had no problems, go to the next section.
+		# If we're verbose, give a nice informational message first.
+		#
+		if(probs == 0):
+			if(verbose):
+				print "%s section:  no problems\n" % sect
+
+			continue
+
+		#
+		# Get the longest field name.
+		#
+		for prob in sorted(probarr):
+			pieces = re.split(':', prob)
+			if(len(pieces[0]) > maxlen):	maxlen = len(pieces[0])
+		maxlen += 1
+
+		#
+		# Print the section name and the problems in the section.
+		#
+		print "problems in %s section:" % sect
+		for prob in probarr:
+			pieces = re.split(':[ \t]*', prob)
+			pieces[0] += ':'
+			print "%-*s  %s" % (maxlen, pieces[0], pieces[1])
+
+		print ""
+
+	#
+	# Give a short message if we didn't find any problems.
+	# Maybe give a problem count if there were problems.
+	#
+	if(probcnt == 0):
+		print "no problems found\n"
+	elif(verbose):
+		print "problems found:  %d\n" % probcnt
+
+
+#------------------------------------------------------------------------
+# Routine:	givesummary()
+#
+# Purpose:	Give a summary of the validation checks results.
+#
+def givesummary(chktype):
+
+	totalerrs = 0			# Total count of errors found.
+	totalunchks = 0			# Total count of unchecked fields.
+	totalvalids = 0			# Total count of valid fields found.
+
+	if(showsummary == 0):
+		return
+
+	if(chktype == CHECKS_BASIC):
+
+		#
+		# Calculate the totals we'll be reporting.
+		#
+		for key in errors.keys():	totalerrs += errors[key]
+		for key in unchecked.keys():	totalunchks += unchecked[key]
+		for key in valids.keys():	totalvalids += valids[key]
+
+		print "summary of basic results:"
+		print "\ttotal valid fields (basic checks):  %d" % totalvalids
+		print "\ttotal errors:  %d" % totalerrs
+		print "\ttotal unchecked fields:  %d" % totalunchks
+
+
+#------------------------------------------------------------------------
+# Routine:	givetable()
+#
+# Purpose:	Give the results in tabular form.
+#
+#		This is a preliminary form.  This will undoubtedly
+#		improve over time.
+#
+def givetable(chktype):
+
+	maxlen = -1			# Maximum section-name length.
+	old_format = 0			# Flag for using old output format.
+
+	if(showtable == 0):
+		return
+
+	if(chktype == CHECKS_BASIC):
+
+		#
+		# Get the longest key name.
+		#
+		for key in sorted(valids):
+			if(len(key) > maxlen):	maxlen = len(key)
+
+		#
+		# Bump the longest key length a shade and print the
+		# column headers.
+		#
+		print "%-*s%12s\t%12s\t%12s" % (maxlen, 'Section', 'Valid', 'Errors', 'Unchecked')
+
+		#
+		# Print the results for each section we checked.
+		#
+		for key in sorted(valids):
+			print "%-*s%12d\t%12d\t%12d" % (maxlen, key,
+								valids[key],
+								errors[key],
+								unchecked[key])
+
+		print ""
+
+
+#------------------------------------------------------------------------
+# Routine:	giveparseerrs()
+#
+# Purpose:	Print the parsing problems encountered.
+#
+def giveparseerrs():
+	global parseerrs		# Collected parsing errors.
+	global badsect			# Invalid config section names.
+
+	#
+	# Report bad section keys .
+	#
+	if(len(parseerrs) > 0):
+		print ""
+		for evt in parseerrs.keys():
+			print "config parse error:  %s" % evt
+			print "\tentries affected:  %d" % parseerrs[evt]
+			print ""
+
+	#
+	# Report bad section names.
+	#
+	nbs = len(badsect)
+	if(nbs > 0):
+		print ""
+		if(nbs > 1):
+			print "%d invalid sections:" % nbs
+		else:
+			print "1 invalid section:"
+
+		for key in badsect.keys():
+			print "\t\"%s\"" % key
+
+
+#----------------------------------------------------------------------
+# Routine:	version()
+#
+# Purpose:	Print the version number(s) and exit.
+#
+def version():
+	print(VERS)
+	exit(0)
+
+
+#----------------------------------------------------------------------
+# Routine:	usage()
+#
+# Purpose:	Do something with the usage message.
+#
+#		If the prtflag parameter is non-zero, we'll print and exit.
+#		If it is zero, we'll just return the string.
+#
+def usage(prtflag):
+
+	#
+	# Set up our usage string.
+	#
+	outstr = """usage:  rsyncdchk [options] <command arguments>
+
+        where [options] are:
+                -config conffile        specify configuration file to validate
+
+                -list                   only list values in rsyncd.conf file
+
+                -basic                  only run basic checks
+
+                -problems               only show problems found
+                -summary                give summary of checks only
+                -table                  provide results in tabular form
+
+                -verbose                give verbose output
+                -Version                show version and exit
+                -help                   show usage message and exit
+                -manpage                show manual page and exit
+ """
+
+	#
+	# Just return the output if we aren't to print the usage string.
+	#
+	if(prtflag == 0):
+		return(outstr)
+
+	#
+	# Print the usage string and exit.
+	#
+	print(outstr.rstrip())
+	exit(0)
+
+#------------------------------------------------------------------------
+
+
+manpage_info = '''
+
+NAME
+
+rsyncdchk - validates the contents of an rsyncd.conf file
+
+SYNOPSIS
+
+  rsyncdchk [options]
+
+DESCRIPTION
+
+rsyncdchk validates the contents of an rsyncd.conf file.  The configuration
+file is validated to ensure that reasonable values are specified for the
+various fields.
+
+The default configuration file is /etc/rsyncd.conf.  The -config option
+allows the user to specify an alternate file to be validated.
+
+CHECK TYPES
+
+rsyncdchk performs one type of checks.  Basic checks are rudimentary
+checks of the configuration values in an rsyncd.conf file.  For example,
+it checks that the "path" field is actually a directory, but not that it
+is used as is expected.
+
+RESULT REPORTING
+
+rsyncdchk provides three types of output:  a problem report, a table of
+results, and a summary.  All three are given by default.  However, any
+combination of the three may be selected by using the -problems, -table,
+and -summary options.
+
+In addition to validating the contents of an rsyncd.conf file, rsyncdchk can
+display the contents.  The -list option will display fields and values in
+the rsyncd.conf file, but no validation will be performed.
+
+OPTIONS
+
+rsyncdchk takes the following options:
+        -config conffile         specify configuration file to validate
+        -list                    list configuration-section information
+        -names                   list configuration-section names;
+                                 must be used in conjunction with -list
+        -section section-name    specify section to examine;
+                                 must be used in conjunction with -list
+
+        -basic                   only run basic checks
+
+	-problems		 only show problems found
+        -summary                 give summary of checks only
+	-table			 provide results in tabular form
+
+        -norpki                  don't check the rpki section
+        -noroot                  don't check the root section
+
+        -verbose                 give verbose output
+        -Version                 show version and exit
+        -help                    show usage message and exit
+        -manpage                 show the manual page and exit
+
+
+COPYRIGHT
+
+Copyright 2015 PARSONS, Inc.  All rights reserved.
+
+AUTHOR
+
+Wayne Morrison, tewok@tislabs.com
+
+SEE ALSO
+
+"RSI-EARS Step-By-Step Guide: Validation Checks Performed by for rsyncd.conf
+Files"
+
+'''
+
+
+#----------------------------------------------------------------------
+# Routine:	manpage()
+#
+# Purpose:	Print the internal manual page and exit.
+#
+def manpage():
+	print(manpage_info)
+	exit(0)
+
+
+#------------------------------------------------------------------------
+
+#
+# Do everything.
+#
+main()
+exit(0)
