@@ -15,3 +15,6 @@ of configuration files used by the rpki.net software.
 
 
 
+(These scripts had been overlooked when the Secure Routing code was
+originally posted here, but are included for the historical record.)
+
